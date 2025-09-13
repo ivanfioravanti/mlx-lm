@@ -1,7 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
-from typing import Any, Dict, List, Optional
 import os
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -716,7 +716,11 @@ class BatchKVCache(_BaseCache):
         # If no left padding for any sequence and no sliding window
         # requested, we can use the fast 'causal' path when callers
         # didn't request a concrete array.
-        if not (return_array or force_array) and fastpath_enabled and window_size is None:
+        if (
+            not (return_array or force_array)
+            and fastpath_enabled
+            and window_size is None
+        ):
             no_left_pad = mx.all(self.left_padding == 0).item()
             if no_left_pad:
                 return "causal"

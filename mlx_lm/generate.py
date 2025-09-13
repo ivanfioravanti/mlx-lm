@@ -2,9 +2,9 @@
 
 import argparse
 import contextlib
-import os
 import functools
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
