@@ -3,7 +3,7 @@
 from mlx_lm import batch_generate, load
 
 # Specify the checkpoint
-checkpoint = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+checkpoint = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit"
 
 # Load the corresponding model and tokenizer
 model, tokenizer = load(path_or_hf_repo=checkpoint)

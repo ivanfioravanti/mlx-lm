@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import os
 import functools
 import json
 import sys
@@ -859,6 +860,7 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        length_bucket_size: Optional[int] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -872,6 +874,16 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
         self._stats = BatchStats()
+        # If set, prompts are bucketed by this many tokens to reduce
+        # left padding within each prefill batch.
+        if length_bucket_size is None:
+            env = os.getenv("MLX_LM_LENGTH_BUCKET_SIZE")
+            if env is not None:
+                try:
+                    length_bucket_size = int(env)
+                except ValueError:
+                    pass
+        self.length_bucket_size = length_bucket_size
 
         self.active_batch = None
 
@@ -885,11 +897,50 @@ class BatchGenerator:
             self.unprocessed_prompts.append((self.uid_count, p, m))
             uids.append(self.uid_count)
             self.uid_count += 1
-        # Sort in ascending order of length
-        self.unprocessed_prompts = sorted(
-            self.unprocessed_prompts, key=lambda x: len(x[1])
-        )
+        # Sort prompts to improve packing: either by (bucket, length)
+        # if bucketing is enabled, or by length alone.
+        if self.length_bucket_size and self.length_bucket_size > 0:
+            bs = self.length_bucket_size
+            self.unprocessed_prompts = sorted(
+                self.unprocessed_prompts,
+                key=lambda x: (len(x[1]) // bs, len(x[1])),
+            )
+        else:
+            self.unprocessed_prompts = sorted(
+                self.unprocessed_prompts, key=lambda x: len(x[1])
+            )
         return uids
+
+    def _pop_next_prefill_group(self):
+        """
+        Pop up to `prefill_batch_size` prompts from the front of the
+        queue. If length bucketing is enabled, ensure all popped prompts
+        belong to the same bucket to minimize left padding.
+        """
+        if not self.unprocessed_prompts:
+            return []
+
+        # No bucketing: take the next chunk
+        if not (self.length_bucket_size and self.length_bucket_size > 0):
+            n = min(len(self.unprocessed_prompts), self.prefill_batch_size)
+            prompts = self.unprocessed_prompts[:n]
+            self.unprocessed_prompts = self.unprocessed_prompts[n:]
+            return prompts
+
+        # Bucketing enabled: take from the first bucket only
+        bs = self.length_bucket_size
+        first_bucket = len(self.unprocessed_prompts[0][1]) // bs
+        end = 0
+        max_take = self.prefill_batch_size
+        for tup in self.unprocessed_prompts:
+            if end >= max_take:
+                break
+            if len(tup[1]) // bs != first_bucket:
+                break
+            end += 1
+        prompts = self.unprocessed_prompts[:end]
+        self.unprocessed_prompts = self.unprocessed_prompts[end:]
+        return prompts
 
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens = zip(*prompts)
@@ -941,7 +992,7 @@ class BatchGenerator:
         num_active = len(batch) if batch else 0
         num_to_add = self.completion_batch_size - num_active
         while num_to_add >= self.prefill_batch_size:
-            prompts = self.unprocessed_prompts[: self.prefill_batch_size]
+            prompts = self._pop_next_prefill_group()
             # Finish processing the last examples of the last batch
             if len(prompts) == 0 and num_active > 0:
                 break
@@ -957,9 +1008,8 @@ class BatchGenerator:
                 tic = time.perf_counter()
 
             batch = self._process_prompts(prompts)
-            self.unprocessed_prompts = self.unprocessed_prompts[
-                self.prefill_batch_size :
-            ]
+            # `_pop_next_prefill_group` already removed the selected
+            # prompts from `self.unprocessed_prompts`.
             prompt_processing = True
             # If there was no active batch, set it
             if self.active_batch is None:

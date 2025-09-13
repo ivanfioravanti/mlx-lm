@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from typing import Any, Dict, List, Optional
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -685,9 +686,48 @@ class BatchKVCache(_BaseCache):
         self.offset -= n
         return n
 
-    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+    def make_mask(
+        self,
+        N: int,
+        return_array: bool = False,
+        window_size: Optional[int] = None,
+        **kwargs,
+    ):
+        """
+        Return an attention mask for a batch with potential left padding.
+
+        Fast path: If `return_array` is False, `window_size` is None, and all
+        sequences have zero left padding, return 'causal' so the kernel can
+        take the optimized path. Otherwise, return an explicit boolean mask
+        array honoring per-sample left padding and `window_size` when provided.
+        """
+        # Env toggles for A/B testing
+        force_array_env = os.getenv("MLX_LM_BATCH_MASK_FORCE_ARRAY", "").lower()
+        fastpath_env = os.getenv("MLX_LM_BATCH_MASK_FASTPATH", "1").lower()
+        force_array = force_array_env in ("1", "true", "t", "yes", "y", "on")
+        fastpath_enabled = fastpath_env not in (
+            "0",
+            "false",
+            "f",
+            "no",
+            "off",
+        )
+
+        # If no left padding for any sequence and no sliding window
+        # requested, we can use the fast 'causal' path when callers
+        # didn't request a concrete array.
+        if not (return_array or force_array) and fastpath_enabled and window_size is None:
+            no_left_pad = mx.all(self.left_padding == 0).item()
+            if no_left_pad:
+                return "causal"
+
+        # Fall back to building the explicit mask to account for
+        # left padding differences and/or sliding window behavior.
         return create_causal_mask(
-            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+            N,
+            offset=self._idx,
+            left_padding=self.left_padding,
+            window_size=window_size,
         )
 
     def filter(self, batch_indices):
