@@ -279,6 +279,28 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _remap_quantization_keys(quantization, model, weights):
+    per_layer_keys = [k for k in quantization if isinstance(quantization[k], dict)]
+    if not per_layer_keys:
+        return
+    weight_prefixes = set()
+    for wk in weights:
+        parts = wk.rsplit(".", 1)
+        if len(parts) == 2:
+            weight_prefixes.add(parts[0])
+    for k in list(per_layer_keys):
+        if k in weight_prefixes:
+            continue
+        if k.startswith("model.language_model."):
+            remapped = k.replace("model.language_model.", "language_model.model.")
+        elif k.startswith("language_model.") and "language_model.model." not in k:
+            remapped = k.replace("language_model.", "language_model.model.", 1)
+        else:
+            continue
+        if remapped in weight_prefixes and remapped not in quantization:
+            quantization[remapped] = quantization.pop(k)
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -363,6 +385,7 @@ def load_model(
         )
 
     if (quantization := config.get("quantization", None)) is not None:
+        _remap_quantization_keys(quantization, model, weights)
         _quantize(quantization)
 
     elif quantization_config := config.get("quantization_config", False):
