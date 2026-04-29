@@ -6,6 +6,7 @@ import json
 import threading
 import types
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -518,6 +519,37 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_run_wires_prompt_cache_bytes(self):
+        from mlx_lm import server as server_module
+
+        captured = {}
+
+        class DummyGroup:
+            def rank(self):
+                return 0
+
+            def size(self):
+                return 1
+
+        def fake_http_server(host, port, response_generator):
+            captured["prompt_cache"] = response_generator.prompt_cache
+
+        class DummyResponseGenerator:
+            def __init__(self, model_provider, prompt_cache):
+                self.prompt_cache = prompt_cache
+
+        model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(prompt_cache_size=3, prompt_cache_bytes=0)
+        )
+
+        with patch.object(server_module.mx.distributed, "init", return_value=DummyGroup()):
+            with patch.object(server_module, "ResponseGenerator", DummyResponseGenerator):
+                with patch.object(server_module, "_run_http_server", fake_http_server):
+                    server_module.run("127.0.0.1", 0, model_provider)
+
+        self.assertEqual(captured["prompt_cache"].max_size, 3)
+        self.assertEqual(captured["prompt_cache"].max_bytes, 0)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 

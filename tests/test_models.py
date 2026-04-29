@@ -339,6 +339,109 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def test_bailing_hybrid_recurrent_gla(self):
+        from mlx_lm.models.bailing_hybrid import recurrent_gla
+
+        def reference_recurrent_gla(q, k, v, g, scale, h=None):
+            in_dtype = q.dtype
+            exp_g = mx.exp(g)[:, None, None].astype(mx.float32)
+            q = (q * scale).astype(mx.float32)
+            k = k.astype(mx.float32)
+            v = v.astype(mx.float32)
+            if h is not None:
+                h = h.astype(mx.float32)
+            outputs = []
+            for t in range(q.shape[2]):
+                q_t = q[:, :, t : t + 1]
+                k_t = k[:, :, t : t + 1]
+                v_t = v[:, :, t : t + 1]
+                h_up = k_t.transpose(0, 1, 3, 2) @ v_t
+                h = h_up if h is None else h * exp_g + h_up
+                outputs.append(q_t @ h)
+            return mx.concatenate(outputs, axis=2).astype(in_dtype), h
+
+        B, H, L, D = 1, 2, 73, 32
+        q = (0.1 * mx.random.normal(shape=(B, H, L, D))).astype(mx.bfloat16)
+        k = (0.1 * mx.random.normal(shape=(B, H, L, D))).astype(mx.bfloat16)
+        v = (0.1 * mx.random.normal(shape=(B, H, L, D))).astype(mx.bfloat16)
+        g = -mx.arange(1, H + 1, dtype=mx.float32) / 8
+        scale = D**-0.5
+
+        y, h = recurrent_gla(q, k, v, g, scale)
+        ref_y, ref_h = reference_recurrent_gla(q, k, v, g, scale)
+        mx.eval(y, h, ref_y, ref_h)
+
+        self.assertEqual(y.dtype, q.dtype)
+        self.assertEqual(h.dtype, mx.float32)
+        self.assertTrue(mx.allclose(y, ref_y, rtol=1e-2, atol=1e-2))
+        self.assertTrue(mx.allclose(h, ref_h, rtol=1e-4, atol=1e-4))
+
+        split = 37
+        y_1, h_1 = recurrent_gla(
+            q[:, :, :split], k[:, :, :split], v[:, :, :split], g, scale
+        )
+        y_2, h_2 = recurrent_gla(
+            q[:, :, split:], k[:, :, split:], v[:, :, split:], g, scale, h_1
+        )
+        split_y = mx.concatenate([y_1, y_2], axis=2)
+        mx.eval(split_y, h_2)
+
+        self.assertTrue(mx.allclose(split_y, ref_y, rtol=1e-2, atol=1e-2))
+        self.assertTrue(mx.allclose(h_2, ref_h, rtol=1e-4, atol=1e-4))
+
+    def test_bailing_hybrid_batch_cache_matches_single_cache(self):
+        from mlx_lm.generate import _merge_caches
+        from mlx_lm.models import bailing_hybrid
+
+        args = bailing_hybrid.ModelArgs.from_dict(
+            {
+                "model_type": "bailing_hybrid",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "moe_intermediate_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "num_shared_experts": 1,
+                "n_group": 2,
+                "topk_group": 2,
+                "first_k_dense_replace": 1,
+                "layer_group_size": 2,
+                "group_norm_size": 2,
+                "vocab_size": 1000,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "max_position_embeddings": 1000,
+                "routed_scaling_factor": 2.5,
+                "head_dim": 32,
+                "kv_lora_rank": 32,
+                "q_lora_rank": 48,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 16,
+                "v_head_dim": 16,
+                "rope_interleave": True,
+                "partial_rotary_factor": 0.5,
+                "use_qk_norm": True,
+                "score_function": "sigmoid",
+                "norm_topk_prob": True,
+                "moe_router_enable_expert_bias": True,
+            }
+        )
+        model = bailing_hybrid.Model(args)
+        inputs = mx.arange(9)[None]
+
+        single_cache = make_prompt_cache(model)
+        batch_cache = _merge_caches([make_prompt_cache(model)])
+        single_outputs = model(inputs, cache=single_cache)
+        batch_outputs = model(inputs, cache=batch_cache)
+        mx.eval(single_outputs, batch_outputs)
+
+        self.assertTrue(
+            mx.allclose(single_outputs, batch_outputs, rtol=1e-5, atol=1e-5)
+        )
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
