@@ -914,6 +914,7 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
+    from .models.mla import MultiLinear, QuantizedMultiLinear
     from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 
     dequantize_layers = []
@@ -928,6 +929,9 @@ def dequantize_model(model: nn.Module) -> nn.Module:
         elif isinstance(module, QuantizedSwitchLinear):
             kwargs = {"bias": bias}
             cls = SwitchLinear
+        elif isinstance(module, QuantizedMultiLinear):
+            kwargs = {}
+            cls = MultiLinear
         else:
             continue
         weight = mx.dequantize(

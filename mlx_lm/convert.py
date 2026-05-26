@@ -16,6 +16,11 @@ from .utils import (
     upload_to_hub,
 )
 
+# Defaults applied to non-quantized layers when --quant-recipe is set;
+# per-layer recipes override these via the predicate.
+_RECIPE_DEFAULT_GROUP_SIZE = 64
+_RECIPE_DEFAULT_BITS = 8
+
 
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module, group_size: int = 64
@@ -96,6 +101,7 @@ def convert(
     quant_predicate: Optional[
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
+    quant_recipe: Optional[str] = None,
     trust_remote_code: bool = False,
 ):
     # Check the save path is empty
@@ -116,6 +122,28 @@ def convert(
         tokenizer_config={"trust_remote_code": trust_remote_code},
         lazy=True,
     )
+
+    if quant_recipe is not None:
+        if quant_predicate is not None:
+            raise ValueError("--quant-recipe and --quant-predicate are mutually exclusive.")
+        if dequantize:
+            raise ValueError("--quant-recipe and --dequantize are mutually exclusive.")
+        import importlib
+
+        module = importlib.import_module(type(model).__module__)
+        recipes = getattr(module, "MIXED_QUANT_RECIPES", {})
+        if quant_recipe not in recipes:
+            raise ValueError(
+                f"Unknown quant recipe '{quant_recipe}' for model "
+                f"{type(model).__name__}. Available: {sorted(recipes)}"
+            )
+        quant_predicate = recipes[quant_recipe]
+        quantize = True
+        if "quantization" in config or "quantization_config" in config:
+            print("[INFO] Source is pre-quantized; dequantizing before reapplying recipe")
+            config.pop("quantization", None)
+            config.pop("quantization_config", None)
+            model = dequantize_model(model)
 
     if isinstance(quant_predicate, str):
         if q_mode != "affine":
@@ -148,11 +176,17 @@ def convert(
 
     if quantize:
         print("[INFO] Quantizing")
+        gs = q_group_size if q_group_size is not None else (
+            _RECIPE_DEFAULT_GROUP_SIZE if quant_recipe is not None else None
+        )
+        bits = q_bits if q_bits is not None else (
+            _RECIPE_DEFAULT_BITS if quant_recipe is not None else None
+        )
         model, config = quantize_model(
             model,
             config,
-            q_group_size,
-            q_bits,
+            gs,
+            bits,
             mode=q_mode,
             quant_predicate=quant_predicate,
         )
@@ -162,6 +196,17 @@ def convert(
         config.pop("quantization", None)
         config.pop("quantization_config", None)
         model = dequantize_model(model)
+
+    import importlib
+
+    model_module = importlib.import_module(type(model).__module__)
+    template = getattr(model_module, "CHAT_TEMPLATE", None)
+    if template is not None and getattr(tokenizer, "chat_template", None) is None:
+        print(
+            f"[INFO] Injecting CHAT_TEMPLATE from {model_module.__name__} "
+            f"(upstream tokenizer has none)"
+        )
+        tokenizer.chat_template = template
 
     save(
         mlx_path,
@@ -223,6 +268,15 @@ def configure_parser() -> argparse.ArgumentParser:
         choices=QUANT_RECIPES,
         type=str,
         required=False,
+    )
+    parser.add_argument(
+        "--quant-recipe",
+        help=(
+            "Model-specific mixed-bit recipe (see MIXED_QUANT_RECIPES in the "
+            "model module). Auto-dequantizes pre-quantized sources first."
+        ),
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--dtype",

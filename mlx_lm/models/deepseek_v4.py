@@ -105,6 +105,82 @@ def make_quantization_config(model):
     }
 
 
+def _q4kx_q8_predicate(path: str, module: nn.Module) -> Union[bool, dict]:
+    # Routed experts -> Q4 affine g32; shared experts / attn (w*) / lm_head -> Q8
+    # affine g64; indexer + compressor stay F16. HyperConnection has no Linear
+    # layers, so it's F16 by construction.
+    q4 = {"group_size": 32, "bits": 4, "mode": "affine"}
+    q8 = {"group_size": 64, "bits": 8, "mode": "affine"}
+    if ".attn.indexer." in path or ".compressor." in path:
+        return False
+    if ".ffn.switch_mlp." in path and path.endswith("_proj"):
+        return q4
+    if ".ffn.shared_experts." in path:
+        return q8
+    if ".attn.w" in path:
+        return q8
+    if path == "lm_head":
+        return q8
+    return False
+
+
+def _q2kx_q8_predicate(path: str, module: nn.Module) -> Union[bool, dict]:
+    # gate_proj / up_proj -> 2-bit g32 affine (~2.5 bpw, Q2_K analog)
+    # down_proj          -> 3-bit g64 affine (~3.5 bpw, more headroom for the
+    # integrator projection, mirroring antirez giving w2 more bits than w1/w3).
+    # Shared experts, attn (w*), lm_head stay at Q8 affine; indexer + compressor F16.
+    q2 = {"group_size": 32, "bits": 2, "mode": "affine"}
+    q3 = {"group_size": 64, "bits": 3, "mode": "affine"}
+    q8 = {"group_size": 64, "bits": 8, "mode": "affine"}
+    if ".attn.indexer." in path or ".compressor." in path:
+        return False
+    if ".ffn.switch_mlp." in path:
+        if path.endswith("down_proj"):
+            return q3
+        if path.endswith("gate_proj") or path.endswith("up_proj"):
+            return q2
+    if ".ffn.shared_experts." in path:
+        return q8
+    if ".attn.w" in path:
+        return q8
+    if path == "lm_head":
+        return q8
+    return False
+
+
+MIXED_QUANT_RECIPES = {
+    "q4kx-q8": _q4kx_q8_predicate,
+    "q2kx-q8": _q2kx_q8_predicate,
+}
+
+
+# DeepSeek-V4 ships without a Jinja chat_template (the README points users at the
+# encoding_dsv4 module). Without one, mlx_lm.generate feeds raw text -> garbage.
+# This template covers single/multi-turn chat in no-thinking ("chat") mode and
+# matches the official encode_messages output for that case. It does NOT cover
+# thinking-mode toggling, reasoning_content, or tool calls -- for those, use the
+# official encoder directly.
+CHAT_TEMPLATE = (
+    "{{- '<｜begin▁of▁sentence｜>' -}}"
+    "{%- if messages[0]['role'] == 'system' -%}"
+        "{{- messages[0]['content'] -}}"
+        "{%- set start = 1 -%}"
+    "{%- else -%}"
+        "{%- set start = 0 -%}"
+    "{%- endif -%}"
+    "{%- for m in messages[start:] -%}"
+        "{%- if m['role'] == 'user' -%}"
+            "{{- '<｜User｜>' + m['content'] -}}"
+        "{%- elif m['role'] == 'assistant' -%}"
+            "{{- '<｜Assistant｜>' + m['content'] + '<｜end▁of▁sentence｜>' -}}"
+        "{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}"
+        "{{- '<｜Assistant｜></think>' -}}"
+    "{%- endif -%}"
+)
+
+
 def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "softmax":
         return mx.softmax(scores, axis=-1, precise=True)
